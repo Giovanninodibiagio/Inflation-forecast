@@ -723,6 +723,245 @@ const CountryContributionChart = ({ countryData }) => {
 };
 
 // ---------------------------------------------------------------------------
+// Sub-index Breakdown Panel
+// ---------------------------------------------------------------------------
+
+const SUB_INDEX_META = {
+  actualRents:       { label: 'Actual Rents',          color: '#6366f1' },
+  electricityGas:    { label: 'Electricity & Gas',     color: '#f59e0b' },
+  fuelsLubricants:   { label: 'Fuels & Lubricants',    color: '#ef4444' },
+  restaurantsHotels: { label: 'Restaurants & Hotels',  color: '#10b981' },
+  recreationCulture: { label: 'Recreation & Culture',  color: '#06b6d4' },
+  clothingFootwear:  { label: 'Clothing & Footwear',   color: '#8b5cf6' },
+  healthcare:        { label: 'Healthcare',            color: '#ec4899' },
+  transportServices: { label: 'Transport Services',   color: '#3b82f6' },
+  newVehicles:       { label: 'New Vehicles',          color: '#14b8a6' },
+  communications:    { label: 'Communications',        color: '#a855f7' },
+  education:         { label: 'Education',             color: '#f97316' },
+};
+
+const SubIndexBreakdownPanel = ({ subIndexData }) => {
+  if (!subIndexData || !subIndexData.months || subIndexData.months.length === 0) return null;
+
+  const last12 = subIndexData.months.slice(-12);
+  const available = subIndexData.available || Object.keys(SUB_INDEX_META);
+  const source = subIndexData.source === 'ecb_sdw' ? 'ECB SDW (live)' : 'derived from components';
+
+  return (
+    <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700 rounded-2xl p-8 mb-8">
+      <div className="flex items-start justify-between mb-6 flex-wrap gap-3">
+        <div>
+          <h2 className="text-2xl font-bold mb-1">HICP Sub-index Breakdown</h2>
+          <p className="text-slate-400 text-sm">
+            11 COICOP sub-categories — Trueflation-inspired granular view · {available.length} series available
+          </p>
+        </div>
+        <span className={`text-xs px-2 py-1 rounded border ${
+          subIndexData.source === 'ecb_sdw'
+            ? 'bg-emerald-900/30 border-emerald-700/50 text-emerald-300'
+            : 'bg-slate-700 border-slate-600 text-slate-400'
+        }`}>
+          {source}
+        </span>
+      </div>
+
+      <ResponsiveContainer width="100%" height={300}>
+        <LineChart data={last12}>
+          <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.1)" />
+          <XAxis dataKey="date" tick={{ fill: '#94a3b8', fontSize: 10 }} stroke="#475569" />
+          <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} stroke="#475569" unit="%" />
+          <Tooltip
+            contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: 8 }}
+            labelStyle={{ color: '#e2e8f0' }}
+            formatter={v => v != null ? `${(+v).toFixed(2)}%` : 'n/a'}
+          />
+          <Legend formatter={v => <span style={{ color: '#cbd5e1', fontSize: 10 }}>{v}</span>} />
+          {available.filter(k => SUB_INDEX_META[k]).map(key => (
+            <Line
+              key={key}
+              type="monotone"
+              dataKey={key}
+              stroke={SUB_INDEX_META[key].color}
+              dot={false}
+              strokeWidth={1.5}
+              name={SUB_INDEX_META[key].label}
+              connectNulls
+            />
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+
+      <p className="text-xs text-slate-500 mt-3">
+        Source: ECB SDW HICP COICOP sub-indices (dataset ICP) · same free API as main components ·
+        Inspired by Trueflation's granular category approach
+      </p>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Leading Indicators Panel
+// ---------------------------------------------------------------------------
+
+const LeadingIndicatorsPanel = ({ leadingData, historyData }) => {
+  if (!leadingData || !leadingData.months || leadingData.months.length === 0) return null;
+
+  // Merge leading data with headline HICP for comparison
+  const headlineByDate = {};
+  (historyData || []).forEach(m => { headlineByDate[m.date] = m.headline; });
+
+  const chartData = leadingData.months.slice(-36).map(m => ({
+    date: m.date,
+    ppi:           m.ppi,
+    import_prices: m.import_prices,
+    labor_costs:   m.labor_costs,
+    hicp:          headlineByDate[m.date] ?? null,
+  }));
+
+  const available = leadingData.available || [];
+  const source = leadingData.source === 'ecb_sdw' ? 'ECB SDW (live)' : leadingData.source;
+
+  const LEAD_META = {
+    ppi:           { label: 'PPI (leads ~3m)',          color: '#f59e0b', lag: 3 },
+    import_prices: { label: 'Import Prices (leads ~2m)', color: '#ef4444', lag: 2 },
+    labor_costs:   { label: 'Labor Costs (leads ~4m)',  color: '#10b981', lag: 4 },
+    hicp:          { label: 'EA HICP (headline)',        color: '#60a5fa', lag: 0 },
+  };
+
+  return (
+    <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700 rounded-2xl p-8 mb-8">
+      <div className="flex items-start justify-between mb-6 flex-wrap gap-3">
+        <div>
+          <h2 className="text-2xl font-bold mb-1">Leading Indicators vs HICP</h2>
+          <p className="text-slate-400 text-sm">
+            PPI and import prices lead CPI by 2-4 months · Labor costs drive services persistence
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`text-xs px-2 py-1 rounded border ${
+            leadingData.source === 'ecb_sdw'
+              ? 'bg-emerald-900/30 border-emerald-700/50 text-emerald-300'
+              : 'bg-amber-900/30 border-amber-700/50 text-amber-300'
+          }`}>
+            {source}
+          </span>
+          <span className="text-xs px-2 py-1 bg-slate-700 rounded border border-slate-600 text-slate-300">
+            Used in ARIMAX exog
+          </span>
+        </div>
+      </div>
+
+      <ResponsiveContainer width="100%" height={280}>
+        <LineChart data={chartData}>
+          <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.1)" />
+          <XAxis dataKey="date" tick={{ fill: '#94a3b8', fontSize: 10 }} stroke="#475569" />
+          <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} stroke="#475569" unit="%" />
+          <Tooltip
+            contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: 8 }}
+            labelStyle={{ color: '#e2e8f0' }}
+            formatter={v => v != null ? `${(+v).toFixed(2)}%` : 'n/a'}
+          />
+          <Legend formatter={v => <span style={{ color: '#cbd5e1', fontSize: 11 }}>{v}</span>} />
+          {['hicp', ...available.filter(k => k !== 'hicp')].filter(k => LEAD_META[k]).map(key => (
+            <Line
+              key={key}
+              type="monotone"
+              dataKey={key}
+              stroke={LEAD_META[key].color}
+              dot={false}
+              strokeWidth={key === 'hicp' ? 2.5 : 1.5}
+              strokeDasharray={key === 'hicp' ? undefined : '4 2'}
+              name={LEAD_META[key].label}
+              connectNulls
+            />
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+
+      <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+        {available.filter(k => LEAD_META[k]).map(key => (
+          <div key={key} className="bg-slate-800/60 rounded-lg p-3 border border-slate-700/60">
+            <div className="font-semibold text-slate-200 mb-1">{LEAD_META[key].label}</div>
+            <div className="text-slate-400">Enters ARIMAX with {LEAD_META[key].lag}-month lag</div>
+            <div className="text-slate-500 mt-1">Source: ECB SDW free API</div>
+          </div>
+        ))}
+      </div>
+
+      <p className="text-xs text-slate-500 mt-3">
+        Leading indicators used as exogenous regressors in ARIMAX — the core insight behind Trueflation
+        applied to free ECB/Eurostat data. Source: ECB Statistical Data Warehouse.
+      </p>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Trueflation Comparison Panel
+// ---------------------------------------------------------------------------
+
+const TrueflationPanel = ({ trueflationData }) => {
+  if (!trueflationData || !trueflationData.available) return null;
+
+  const spread = trueflationData.spread_us_minus_ea;
+  const isUpside = spread > 1.0;
+  const isDownside = spread < -1.0;
+
+  return (
+    <div className="bg-gradient-to-br from-slate-800 to-slate-900 border border-amber-700/40 rounded-2xl p-8 mb-8">
+      <div className="flex items-start justify-between mb-4 flex-wrap gap-3">
+        <div>
+          <div className="flex items-center gap-2 mb-1">
+            <h2 className="text-2xl font-bold">Trueflation Signal</h2>
+            <span className="text-xs px-2 py-0.5 bg-amber-900/40 border border-amber-700/50 rounded text-amber-300">
+              US only
+            </span>
+          </div>
+          <p className="text-slate-400 text-sm">
+            US real-time inflation as cross-Atlantic leading signal · {trueflationData.lag_months}-month lead
+          </p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+        <div className="bg-slate-800/60 rounded-xl p-4 border border-slate-700/60">
+          <div className="text-slate-400 text-xs mb-1">US Real-time (Trueflation)</div>
+          <div className="text-3xl font-bold text-white">{trueflationData.us_realtime?.toFixed(1)}%</div>
+          <div className="text-xs text-slate-500 mt-1">Daily frequency · 10M+ data points</div>
+        </div>
+        <div className="bg-slate-800/60 rounded-xl p-4 border border-slate-700/60">
+          <div className="text-slate-400 text-xs mb-1">EA HICP (official)</div>
+          <div className="text-3xl font-bold text-white">{trueflationData.ea_headline?.toFixed(1) ?? 'n/a'}%</div>
+          <div className="text-xs text-slate-500 mt-1">Monthly · Eurostat HICP methodology</div>
+        </div>
+        <div className={`rounded-xl p-4 border ${
+          isUpside   ? 'bg-red-900/20 border-red-700/40' :
+          isDownside ? 'bg-emerald-900/20 border-emerald-700/40' :
+                       'bg-slate-800/60 border-slate-700/60'
+        }`}>
+          <div className="text-slate-400 text-xs mb-1">US–EA Spread</div>
+          <div className={`text-3xl font-bold ${
+            isUpside ? 'text-red-300' : isDownside ? 'text-emerald-300' : 'text-white'
+          }`}>
+            {spread != null ? (spread > 0 ? '+' : '') + spread.toFixed(1) + 'pp' : 'n/a'}
+          </div>
+          <div className={`text-xs mt-1 ${
+            isUpside ? 'text-red-400' : isDownside ? 'text-emerald-400' : 'text-slate-500'
+          }`}>
+            {trueflationData.lead_signal}
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-amber-900/10 border border-amber-700/30 rounded-lg p-3 text-xs text-amber-300/80">
+        ⚠ {trueflationData.caveat} US/EA divergence is common during EUR-specific shocks (e.g. energy crises).
+        This signal is most useful in global supply-chain-driven inflation cycles.
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -738,6 +977,10 @@ const EurozoneInflationTool = () => {
   const [selectedMetric, setSelectedMetric] = useState('headline');
   // Track whether fan bands came from API (Python ensemble) or local JS fallback
   const [forecastSource, setForecastSource] = useState('local');
+  // New: sub-indices, leading indicators, trueflation (all optional/non-blocking)
+  const [subIndexData, setSubIndexData] = useState(null);
+  const [leadingData, setLeadingData] = useState(null);
+  const [trueflationData, setTrueflationData] = useState(null);
 
   // Fetch fan bands from Python API
   const fetchForecast = useCallback(async (method, periods) => {
@@ -785,6 +1028,11 @@ const EurozoneInflationTool = () => {
         setApiError(true);
       })
       .finally(() => setLoading(false));
+
+    // Non-blocking enrichment fetches (all optional — fail silently)
+    apiFetch('/subindices').then(setSubIndexData).catch(() => null);
+    apiFetch('/leading-indicators').then(setLeadingData).catch(() => null);
+    apiFetch('/trueflation').then(d => d?.available ? setTrueflationData(d) : null).catch(() => null);
   }, []);
 
   // Re-fetch forecast whenever methodology or horizon changes
@@ -934,6 +1182,11 @@ const EurozoneInflationTool = () => {
                   <span className="px-2 py-1 bg-slate-700 rounded">✓ ARIMA(1,1,1)</span>
                   <span className="px-2 py-1 bg-slate-700 rounded">✓ ARIMAX + commodity exog</span>
                   <span className="px-2 py-1 bg-slate-700 rounded">✓ 10k MC paths</span>
+                  {leadingData?.available?.length > 0 && (
+                    <span className="px-2 py-1 bg-indigo-900/40 rounded text-indigo-300">
+                      ✓ PPI / Import / Labor exog
+                    </span>
+                  )}
                 </>
               )}
               {methodology === 'boe' && (
@@ -1075,6 +1328,15 @@ const EurozoneInflationTool = () => {
               </ResponsiveContainer>
             </div>
           </div>
+
+          {/* Sub-index breakdown */}
+          <SubIndexBreakdownPanel subIndexData={subIndexData} />
+
+          {/* Leading indicators */}
+          <LeadingIndicatorsPanel leadingData={leadingData} historyData={data} />
+
+          {/* Trueflation signal (only renders if API key set + data available) */}
+          <TrueflationPanel trueflationData={trueflationData} />
 
           {/* Footer */}
           <div className="text-center text-xs text-slate-600 pb-4">

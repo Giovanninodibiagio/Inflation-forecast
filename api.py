@@ -20,16 +20,20 @@ Data sources (priority order, no API key required for the first two):
   3. Hardcoded simulated data — last resort if all APIs are unreachable.
 
 Endpoints:
-    GET /api/health          server status + feature flags
-    GET /api/history         last 36 months of HICP component data
-    GET /api/forecast        probabilistic fan chart (query: periods, methodology)
-    GET /api/commodities     commodity signals panel (Brent, EU gas, EUR/USD)
+    GET /api/health               server status + feature flags
+    GET /api/history              last 36 months of HICP component data (4 components)
+    GET /api/subindices           11 HICP COICOP sub-category time series
+    GET /api/leading-indicators   PPI, Import Prices, Labor Costs (ECB SDW)
+    GET /api/forecast             probabilistic fan chart (query: periods, methodology)
+    GET /api/commodities          commodity signals panel (Brent, EU gas, EUR/USD)
+    GET /api/trueflation          US real-time inflation as EA leading signal (optional)
 """
 
 import io
 import os
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -39,7 +43,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from eurozone_inflation_analyzer import EurozoneInflationAnalyzer
+from eurozone_inflation_analyzer import EurozoneInflationAnalyzer, LeadingIndicatorFetcher
 
 warnings.filterwarnings("ignore")
 
@@ -61,6 +65,16 @@ app.add_middleware(
 )
 
 FRED_API_KEY: Optional[str] = os.getenv("FRED_API_KEY")
+TRUFLATION_API_KEY: Optional[str] = os.getenv("TRUFLATION_API_KEY")
+
+_leading_fetcher: Optional[LeadingIndicatorFetcher] = None
+
+
+def _get_leading_fetcher() -> LeadingIndicatorFetcher:
+    global _leading_fetcher
+    if _leading_fetcher is None:
+        _leading_fetcher = LeadingIndicatorFetcher()
+    return _leading_fetcher
 
 # ---------------------------------------------------------------------------
 # Simulated historical data (mirrors React's hardcoded arrays)
@@ -165,6 +179,7 @@ def _build_simulated_history(weights: Dict[str, float]) -> List[Dict]:
         e   = _SIM_COMPONENTS["energy"][i]
         core = (s * weights["services"] + neg * weights["non_energy_goods"]) / core_denom
 
+        # Simulated sub-indices derived from parent components
         months.append({
             "date":              d.strftime("%Y-%m"),
             "headline":          round(h, 2),
@@ -173,6 +188,19 @@ def _build_simulated_history(weights: Dict[str, float]) -> List[Dict]:
             "nonEnergyGoods":    round(neg, 2),
             "foodAlcoholTobacco":round(f, 2),
             "energy":            round(e, 2),
+            "subIndices": {
+                "actualRents":       round(s * 0.85, 2),
+                "electricityGas":    round(e * 0.60, 2),
+                "fuelsLubricants":   round(e * 0.40, 2),
+                "restaurantsHotels": round(s * 1.05, 2),
+                "recreationCulture": round(s * 0.70, 2),
+                "clothingFootwear":  round(neg * 0.90, 2),
+                "healthcare":        round(s * 0.80, 2),
+                "transportServices": round(s * 0.75, 2),
+                "newVehicles":       round(neg * 0.75, 2),
+                "communications":    round(neg * 0.40, 2),
+                "education":         round(s * 0.95, 2),
+            },
         })
     return months
 
@@ -231,6 +259,42 @@ _ECB_SERIES = {
 
 _ECB_BASE = "https://data-api.ecb.europa.eu/service/data/ICP/M.U2.N.{code}.4.ANR"
 
+# HICP COICOP sub-category item codes (same ECB SDW dataset, no API key required)
+_ECB_SUBINDICES = {
+    "actualRents":        "CP041",   # Actual rentals for housing       ~6.5%
+    "electricityGas":     "CP045",   # Electricity, gas & other fuels   ~4.5%
+    "fuelsLubricants":    "CP0722",  # Fuels & lubricants (transport)   ~3.1%
+    "restaurantsHotels":  "CP11",    # Restaurants & hotels             ~9.2%
+    "recreationCulture":  "CP09",    # Recreation & culture             ~8.7%
+    "clothingFootwear":   "CP03",    # Clothing & footwear              ~5.7%
+    "healthcare":         "CP06",    # Healthcare                       ~4.4%
+    "transportServices":  "CP073",   # Transport services (excl. fuels) ~3.2%
+    "newVehicles":        "CP0711",  # New vehicles                     ~2.1%
+    "communications":     "CP08",    # Communications                   ~2.4%
+    "education":          "CP10",    # Education                        ~1.1%
+}
+
+
+def _fetch_ecb_subindices(start: str = "2022-01") -> Dict[str, Optional[pd.Series]]:
+    """
+    Fetch all HICP sub-index series from ECB SDW in parallel.
+    Returns a dict mapping sub-index name → pd.Series (None on failure).
+    Uses ThreadPoolExecutor to keep latency ~1-2s instead of 11s serial.
+    """
+    results: Dict[str, Optional[pd.Series]] = {}
+
+    def fetch_one(name: str, code: str) -> tuple:
+        return name, _fetch_ecb_sdw_series(code, start)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_one, name, code): name
+                   for name, code in _ECB_SUBINDICES.items()}
+        for future in as_completed(futures):
+            name, series = future.result()
+            results[name] = series
+
+    return results
+
 
 def _fetch_ecb_sdw_series(code: str, start: str = "2022-01") -> Optional[pd.Series]:
     """
@@ -256,14 +320,30 @@ def _fetch_ecb_sdw_series(code: str, start: str = "2022-01") -> Optional[pd.Seri
 
 def _fetch_ecb_hicp_real(start: str = "2022-01") -> Optional[List[Dict]]:
     """
-    Fetch all 5 HICP series from the ECB SDW and return in React-friendly format.
+    Fetch all 5 HICP series + 11 sub-indices from the ECB SDW.
 
     Returns None only if the headline series itself is unavailable.
-    Missing component series are left as None in the output (React handles gracefully).
+    Missing component/sub-index series are left as None (React handles gracefully).
+    Sub-indices are fetched in parallel using ThreadPoolExecutor.
     """
+    # Fetch main 5 series and 11 sub-indices concurrently
     series: Dict[str, Optional[pd.Series]] = {}
-    for name, code in _ECB_SERIES.items():
-        series[name] = _fetch_ecb_sdw_series(code, start)
+    sub_series: Dict[str, Optional[pd.Series]] = {}
+
+    def fetch_main(name: str, code: str) -> tuple:
+        return name, _fetch_ecb_sdw_series(code, start)
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        main_futures = {executor.submit(fetch_main, name, code): name
+                        for name, code in _ECB_SERIES.items()}
+        sub_futures  = {executor.submit(fetch_main, name, code): name
+                        for name, code in _ECB_SUBINDICES.items()}
+        for future in as_completed({**main_futures, **sub_futures}):
+            name, s = future.result()
+            if name in _ECB_SERIES:
+                series[name] = s
+            else:
+                sub_series[name] = s
 
     if series["headline"] is None:
         return None  # Can't build anything without the headline
@@ -273,6 +353,11 @@ def _fetch_ecb_hicp_real(start: str = "2022-01") -> Optional[List[Dict]]:
     aligned: Dict[str, pd.Series] = {}
     for name, s in series.items():
         aligned[name] = s.reindex(idx) if s is not None else pd.Series(np.nan, index=idx)
+
+    # Align sub-index series
+    aligned_sub: Dict[str, pd.Series] = {}
+    for name, s in sub_series.items():
+        aligned_sub[name] = s.reindex(idx) if s is not None else pd.Series(np.nan, index=idx)
 
     # HICP weights for core calculation
     w_s  = 0.457   # services
@@ -293,6 +378,12 @@ def _fetch_ecb_hicp_real(start: str = "2022-01") -> Optional[List[Dict]]:
         def _v(x: float) -> Optional[float]:
             return round(float(x), 2) if not np.isnan(x) else None
 
+        # Build sub-indices dict (only include keys where data exists)
+        sub_dict = {}
+        for sub_name, sub_aligned in aligned_sub.items():
+            val = sub_aligned.get(period, np.nan)
+            sub_dict[sub_name] = _v(val)
+
         months.append({
             "date":              period,
             "headline":          _v(h),
@@ -301,6 +392,7 @@ def _fetch_ecb_hicp_real(start: str = "2022-01") -> Optional[List[Dict]]:
             "nonEnergyGoods":    _v(neg),
             "foodAlcoholTobacco":_v(f),
             "energy":            _v(e),
+            "subIndices":        sub_dict,
         })
 
     return months
@@ -483,10 +575,12 @@ def _extract_commodity_history(
 def health() -> Dict:
     az = _get_analyzer()
     return {
-        "status":        "ok",
-        "fred_available": bool(FRED_API_KEY),
-        "weight_source": az._weight_source,
-        "weights":       az.HICP_WEIGHTS,
+        "status":              "ok",
+        "fred_available":      bool(FRED_API_KEY),
+        "weight_source":       az._weight_source,
+        "weights":             az.HICP_WEIGHTS,
+        "subindices_available": True,
+        "subindices_count":    len(_ECB_SUBINDICES),
     }
 
 
@@ -664,3 +758,176 @@ def commodities() -> Dict:
 
     _cache_set("commodities", result)
     return result
+
+
+@app.get("/api/subindices")
+def subindices() -> Dict:
+    """
+    Return HICP sub-index time series (11 COICOP categories).
+
+    Fetches from ECB SDW in parallel (same free API as /api/history).
+    Falls back to values derived from the 4 parent components if unavailable.
+    Kept as a separate endpoint to avoid bloating /api/history payload.
+    """
+    cached = _cache_get("subindices")
+    if cached:
+        return cached
+
+    # Try ECB SDW first
+    az = _get_analyzer()
+    sub_series = _fetch_ecb_subindices(start="2022-01")
+    available  = [k for k, v in sub_series.items() if v is not None]
+    source     = "ecb_sdw" if available else "simulated"
+
+    if available:
+        # Align to the union of all available indices
+        all_indices = set()
+        for s in sub_series.values():
+            if s is not None:
+                all_indices.update(s.index.tolist())
+        idx = sorted(all_indices)
+
+        months: List[Dict] = []
+        for period in idx:
+            row: Dict[str, Any] = {"date": period}
+            for name, s in sub_series.items():
+                if s is not None and period in s.index:
+                    val = s[period]
+                    row[name] = round(float(val), 2) if not np.isnan(val) else None
+                else:
+                    row[name] = None
+            months.append(row)
+    else:
+        # Fallback: derive from simulated parent components
+        sim = _build_simulated_history(az.HICP_WEIGHTS)
+        months = [
+            {"date": m["date"], **m.get("subIndices", {})}
+            for m in sim
+        ]
+
+    result = {
+        "months":    months,
+        "source":    source,
+        "available": available,
+        "meta": {k: {"label": k, "source": "ecb_sdw"}
+                 for k in _ECB_SUBINDICES},
+    }
+    _cache_set("subindices", result)
+    return result
+
+
+@app.get("/api/leading-indicators")
+def leading_indicators() -> Dict:
+    """
+    Return macroeconomic leading indicator time series.
+
+    Fetches from ECB SDW (free, no API key):
+      - PPI (Producer Price Index):  leads HICP by ~2-4 months
+      - Import Price Index:           leads HICP by ~1-3 months
+      - Labor Costs / Negotiated wages: leads services inflation by ~3-6 months
+
+    These are used as extra ARIMAX exogenous regressors when available.
+    Returns null values if ECB SDW is unreachable.
+    """
+    cached = _cache_get("leading_indicators")
+    if cached:
+        return cached
+
+    fetcher = _get_leading_fetcher()
+    df = fetcher.get_dataframe()
+    available = []
+    months: List[Dict] = []
+
+    if df is not None and not df.empty:
+        available = list(df.columns)
+        for dt, row in df.iterrows():
+            entry: Dict[str, Any] = {"date": str(dt)[:7]}  # YYYY-MM
+            for col in df.columns:
+                v = row[col]
+                entry[col] = round(float(v), 2) if not (v is None or (isinstance(v, float) and np.isnan(v))) else None
+            months.append(entry)
+        source = "ecb_sdw"
+    else:
+        source = "unavailable"
+
+    result = {
+        "months":    months,
+        "source":    source,
+        "available": available,
+        "lags":      {"ppi": 3, "import_prices": 2, "labor_costs": 4},
+        "note":      "Leading indicators used as extra ARIMAX regressors when available.",
+    }
+    _cache_set("leading_indicators", result)
+    return result
+
+
+@app.get("/api/trueflation")
+def trueflation() -> Dict:
+    """
+    Return Trueflation US real-time inflation as a cross-Atlantic leading signal.
+
+    IMPORTANT CAVEAT: Trueflation measures US inflation only (not Eurozone).
+    Used here as a directional leading signal — US inflation often precedes
+    EA inflation by ~2-3 months in supply-chain-driven cycles. This signal
+    can diverge significantly during EUR-specific shocks.
+
+    Requires TRUFLATION_API_KEY env var. Returns {"available": false} without it.
+    """
+    if not TRUFLATION_API_KEY:
+        return {
+            "available": False,
+            "reason":    "TRUFLATION_API_KEY env var not set",
+            "caveat":    "Trueflation measures US inflation only — Eurozone leading signal only.",
+        }
+
+    cached = _cache_get("trueflation")
+    if cached:
+        return cached
+
+    try:
+        resp = requests.get(
+            "https://api.truflation.com/inflation",
+            headers={"Authorization": f"Bearer {TRUFLATION_API_KEY}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        us_inflation = float(data.get("yearOverYear", data.get("value", 0)))
+
+        # Get current EA headline from cached history for comparison
+        hist = _cache_get("history")
+        ea_headline = None
+        if hist and hist.get("months"):
+            last = hist["months"][-1]
+            ea_headline = last.get("headline")
+
+        spread = round(us_inflation - ea_headline, 2) if ea_headline is not None else None
+        if spread is not None:
+            if spread > 1.0:
+                lead_signal = "US elevated — potential EA upside in 2-3 months"
+            elif spread < -1.0:
+                lead_signal = "US below EA — potential EA downside in 2-3 months"
+            else:
+                lead_signal = "US/EA spread neutral"
+        else:
+            lead_signal = "insufficient data"
+
+        result = {
+            "available":          True,
+            "us_realtime":        round(us_inflation, 2),
+            "ea_headline":        ea_headline,
+            "spread_us_minus_ea": spread,
+            "lead_signal":        lead_signal,
+            "lag_months":         2,
+            "source":             "truflation",
+            "caveat":             "US-only data — directional EA leading signal only.",
+        }
+        _cache_set("trueflation", result)
+        return result
+
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason":    f"Trueflation API error: {exc}",
+            "caveat":    "Trueflation measures US inflation only — Eurozone leading signal only.",
+        }

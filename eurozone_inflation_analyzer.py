@@ -1203,15 +1203,18 @@ class CommodityFetcher:
         )
 
     def build_exog_matrix(self, df: pd.DataFrame,
-                          target_index: pd.DatetimeIndex) -> pd.DataFrame:
+                          target_index: pd.DatetimeIndex,
+                          extra_exog: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
         Build aligned lagged % change matrix for ARIMAX fitting.
 
         Columns returned:
           d_brent_lag1:  1-month lagged % change in Brent (energy pass-through)
           d_eurusd_lag1: 1-month lagged % change in EUR/USD (import price channel)
+          + any columns from extra_exog (e.g. leading indicators)
 
         Both are stationary (already % changes) and enter ARIMAX directly.
+        extra_exog: optional DataFrame with the same index — e.g. from LeadingIndicatorFetcher.
         """
         exog = pd.DataFrame(index=target_index)
 
@@ -1224,6 +1227,12 @@ class CommodityFetcher:
             pct = df[col].pct_change() * 100
             aligned = pct.reindex(target_index, method='nearest')
             exog[out_name] = aligned.shift(lag)
+
+        # Append leading indicator columns if provided
+        if extra_exog is not None and not extra_exog.empty:
+            aligned_extra = extra_exog.reindex(target_index, method='nearest')
+            for col in aligned_extra.columns:
+                exog[col] = aligned_extra[col]
 
         return exog
 
@@ -1352,6 +1361,174 @@ class CommodityFetcher:
 
 
 # ===========================================================================
+# Leading Indicator Fetcher (PPI, Import Prices, Labor Costs)
+# ===========================================================================
+
+class LeadingIndicatorFetcher:
+    """
+    Fetches macroeconomic leading indicators from the ECB Statistical Data Warehouse.
+    These series lead HICP by 2-6 months and are used as extra exogenous regressors
+    in the ARIMAX model:
+
+      - Producer Price Index (PPI):      leads CPI by ~2-4 months
+      - Import Price Index:              leads CPI by ~1-3 months
+      - Negotiated wages / labor costs:  leads services inflation by ~3-6 months (quarterly)
+
+    All series are free from ECB SDW — no API key required.
+    Cache: ~/.inflation_cache/leading_indicators.parquet  (6-hour TTL)
+    """
+
+    CACHE_FILE = Path.home() / '.inflation_cache' / 'leading_indicators.parquet'
+    CACHE_TTL_HOURS = 6
+
+    # ECB SDW series keys for the STS (Short-Term Statistics) dataset
+    ECB_STS_BASE = "https://data-api.ecb.europa.eu/service/data/STS/M.U2.N.{key}.NS0010.4.000"
+    # ECB SDW series for negotiated wage growth (quarterly, MNA dataset)
+    ECB_WAGES_URL = (
+        "https://data-api.ecb.europa.eu/service/data/MNA/"
+        "Q.U2.Y.W0.S1.S1._Z.EMP.CI._Z._Z._Z.GY"
+    )
+
+    def fetch_ppi(self, start: str = "2018-01") -> Optional[pd.Series]:
+        """Fetch EA Producer Price Index (YoY %) from ECB STS dataset."""
+        url = (
+            f"{self.ECB_STS_BASE.format(key='PROD')}"
+            f"?format=csvdata&startPeriod={start}&detail=dataonly"
+        )
+        return self._fetch_sdw_series(url, "PPI")
+
+    def fetch_import_prices(self, start: str = "2018-01") -> Optional[pd.Series]:
+        """Fetch EA Import Price Index (YoY %) from ECB STS dataset."""
+        url = (
+            f"{self.ECB_STS_BASE.format(key='IMPT')}"
+            f"?format=csvdata&startPeriod={start}&detail=dataonly"
+        )
+        return self._fetch_sdw_series(url, "Import Prices")
+
+    def fetch_labor_costs(self, start: str = "2018-01") -> Optional[pd.Series]:
+        """
+        Fetch EA negotiated wages / labor cost growth (quarterly YoY %) from ECB MNA.
+        Quarterly data is forward-filled to monthly frequency.
+        """
+        url = f"{self.ECB_WAGES_URL}?format=csvdata&startPeriod={start}&detail=dataonly"
+        s = self._fetch_sdw_series(url, "Labor Costs")
+        if s is None:
+            return None
+        # Convert quarterly period strings (e.g. "2023-Q1") to monthly DatetimeIndex
+        # and forward-fill to monthly frequency
+        try:
+            monthly_idx = pd.date_range(
+                start=pd.Period(s.index[0], freq='Q').to_timestamp(),
+                end=pd.Period(s.index[-1], freq='Q').to_timestamp() + pd.DateOffset(months=2),
+                freq='MS',
+            )
+            quarterly_dt = pd.Series(
+                s.values,
+                index=[pd.Period(p, freq='Q').to_timestamp() for p in s.index],
+            )
+            return quarterly_dt.reindex(monthly_idx, method='ffill')
+        except Exception:
+            return None
+
+    def build_exog_matrix(self, target_index: pd.DatetimeIndex,
+                          lags: Optional[Dict[str, int]] = None) -> pd.DataFrame:
+        """
+        Build aligned lagged % change matrix for ARIMAX.
+
+        Columns: d_ppi_lag{n}, d_import_lag{n}, d_labor_lag{n}
+        Lags default: PPI=3, Import Prices=2, Labor Costs=4 months.
+        """
+        if lags is None:
+            lags = {"ppi": 3, "import": 2, "labor": 4}
+
+        cached = self._load_cache()
+        if cached is not None:
+            df = cached
+        else:
+            df = self._fetch_all()
+            if df is not None and not df.empty:
+                self._save_cache(df)
+
+        exog = pd.DataFrame(index=target_index)
+        if df is None or df.empty:
+            return exog
+
+        for col, lag_key, out_name in [
+            ("ppi",           "ppi",    "d_ppi_lag"),
+            ("import_prices", "import", "d_import_lag"),
+            ("labor_costs",   "labor",  "d_labor_lag"),
+        ]:
+            if col not in df.columns:
+                continue
+            lag = lags[lag_key]
+            pct = df[col].pct_change() * 100
+            aligned = pct.reindex(target_index, method='nearest')
+            exog[f"{out_name}{lag}"] = aligned.shift(lag)
+
+        return exog
+
+    def get_dataframe(self) -> Optional[pd.DataFrame]:
+        """Return the latest fetched leading indicator DataFrame (for API endpoint)."""
+        cached = self._load_cache()
+        if cached is not None:
+            return cached
+        df = self._fetch_all()
+        if df is not None and not df.empty:
+            self._save_cache(df)
+        return df
+
+    # ---- private ----
+
+    def _fetch_all(self) -> Optional[pd.DataFrame]:
+        ppi    = self.fetch_ppi()
+        imp    = self.fetch_import_prices()
+        labor  = self.fetch_labor_costs()
+        series = {}
+        if ppi   is not None: series["ppi"]           = ppi
+        if imp   is not None: series["import_prices"] = imp
+        if labor is not None: series["labor_costs"]   = labor
+        if not series:
+            return None
+        return pd.concat(series, axis=1).sort_index()
+
+    def _fetch_sdw_series(self, url: str, label: str) -> Optional[pd.Series]:
+        try:
+            import io as _io
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            df = pd.read_csv(_io.StringIO(resp.text))
+            df.columns = [c.strip() for c in df.columns]
+            df = df[["TIME_PERIOD", "OBS_VALUE"]].dropna()
+            df["OBS_VALUE"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
+            df = df.dropna()
+            return df.set_index("TIME_PERIOD")["OBS_VALUE"]
+        except Exception as e:
+            print(f"ECB SDW {label} fetch failed (non-fatal): {e}")
+            return None
+
+    def _is_cache_valid(self) -> bool:
+        if not self.CACHE_FILE.exists():
+            return False
+        age_hours = (datetime.now().timestamp() - self.CACHE_FILE.stat().st_mtime) / 3600
+        return age_hours < self.CACHE_TTL_HOURS
+
+    def _load_cache(self) -> Optional[pd.DataFrame]:
+        if not self._is_cache_valid():
+            return None
+        try:
+            return pd.read_parquet(self.CACHE_FILE)
+        except Exception:
+            return None
+
+    def _save_cache(self, df: pd.DataFrame) -> None:
+        try:
+            self.CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(self.CACHE_FILE)
+        except Exception as e:
+            print(f"Leading indicators cache write failed (non-fatal): {e}")
+
+
+# ===========================================================================
 # Updated Main Analyzer Class
 # ===========================================================================
 
@@ -1411,6 +1588,10 @@ class EurozoneInflationAnalyzer:
         self.commodity_fetcher = CommodityFetcher()
         self._commodity_df: pd.DataFrame = pd.DataFrame()
         self._commodity_snapshot: Optional[CommoditySnapshot] = None
+
+        # Leading indicator fetcher (PPI, Import Prices, Labor Costs)
+        self.leading_fetcher = LeadingIndicatorFetcher()
+        self._leading_exog: Optional[pd.DataFrame] = None
 
     # ------------------------------------------------------------------
     # Data fetching (backwards compatible)
@@ -1598,12 +1779,27 @@ class EurozoneInflationAnalyzer:
         forecast_exog: Optional[np.ndarray] = None
         if not self._commodity_df.empty:
             target_idx = pd.DatetimeIndex(pd.to_datetime(data['date']))
+
+            # Fetch leading indicators and merge into exog (best-effort)
+            try:
+                leading_exog = self.leading_fetcher.build_exog_matrix(target_idx)
+                if leading_exog.empty:
+                    leading_exog = None
+            except Exception:
+                leading_exog = None
+
             exog = self.commodity_fetcher.build_exog_matrix(
-                self._commodity_df, target_idx
+                self._commodity_df, target_idx, extra_exog=leading_exog
             )
             forecast_exog = self.commodity_fetcher.build_forecast_exog(
                 self._commodity_df, periods
             )
+            # Append flat forward path for leading indicators (slow-moving; use last known)
+            if leading_exog is not None and not leading_exog.empty and forecast_exog is not None:
+                n_leading = leading_exog.shape[1]
+                last_vals = leading_exog.iloc[-1].fillna(0).values
+                leading_fwd = np.tile(last_vals, (periods, 1))
+                forecast_exog = np.hstack([forecast_exog, leading_fwd])
 
         # Ensemble forecast (ARIMAX uses commodity exog when available)
         central, residuals = self.ensemble.fit_and_forecast(
